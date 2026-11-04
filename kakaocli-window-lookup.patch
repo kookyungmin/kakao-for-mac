@@ -1,0 +1,113 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -40,6 +40,53 @@
+         }
+     }
+ 
++    /// AXWindows can omit a window while KakaoTalk changes its active window.
++    private func chatWindows(_ app: AXUIElement) -> [AXUIElement] {
++        var windows = AXHelpers.windows(app)
++        for name in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
++            var value: AnyObject?
++            if AXUIElementCopyAttributeValue(app, name as CFString, &value) == .success,
++               let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
++                let window = value as! AXUIElement
++                if !windows.contains(where: { CFEqual($0, window) }) { windows.append(window) }
++            }
++        }
++        return windows.filter {
++            let role = AXHelpers.role($0)
++            return role == nil || role == "AXWindow"
++        }
++    }
++
++    private func chatWindowTitle(_ window: AXUIElement) -> String {
++        if let title = AXHelpers.title(window), !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
++            return title
++        }
++        // Use only the window's explicit title element, never message/sender text.
++        var value: AnyObject?
++        if AXUIElementCopyAttributeValue(window, kAXTitleUIElementAttribute as CFString, &value) == .success,
++           let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
++            let titleElement = value as! AXUIElement
++            return AXHelpers.title(titleElement) ?? AXHelpers.value(titleElement) ?? ""
++        }
++        return ""
++    }
++
++    /// Explicit diagnostic metadata only; never includes messages or input values.
++    public func windowReport() throws -> [[String: Any]] {
++        guard AXIsProcessTrusted() else {
++            throw AutomationError.sendFailed("accessibility_permission_denied")
++        }
++        let app = try AXHelpers.appElement(bundleId: Self.bundleId)
++        return chatWindows(app).map { window in
++            ["title": chatWindowTitle(window),
++             "role": AXHelpers.role(window) ?? "",
++             "identifier": AXHelpers.identifier(window) ?? "",
++             "minimized": AXHelpers.boolAttribute(window, kAXMinimizedAttribute as String) == true,
++             "editable_input": findInputField(in: window) != nil,
++             "send_button": (try? sendButton(in: window)) != nil]
++        }
++    }
++
+     /// Never activates, opens, raises, clicks, or changes the selected chat.
+     /// Selects a unique named window even when other chat windows are open.
+     private func backgroundTarget(to chatName: String) throws -> (pid_t, AXUIElement, AXUIElement) {
+@@ -50,9 +97,9 @@
+             throw AutomationError.sendFailed("background_app_not_running")
+         }
+         let app = AXUIElementCreateApplication(process.processIdentifier)
+-        let windows = AXHelpers.windows(app).filter { AXHelpers.role($0) == "AXWindow" }
++        let windows = chatWindows(app)
+         let index = try BackgroundWindowSelection.index(
+-            titles: windows.map { AXHelpers.title($0) ?? "" }, chatName: chatName)
++            titles: windows.map { chatWindowTitle($0) }, chatName: chatName)
+         let window = windows[index]
+         guard let input = findInputField(in: window) else {
+             throw AutomationError.inputFieldNotFound
+@@ -195,7 +242,7 @@
+                 return windows[try BackgroundWindowSelection.index(
+                     titles: windows.map { AXHelpers.title($0) ?? "" }, chatName: chatName)]
+             } catch {
+-                if String(describing: error).contains("background_window_required") { return nil }
++                if ["background_window_required", "background_window_name_mismatch", "background_windows_unavailable"].contains(where: { String(describing: error).contains($0) }) { return nil }
+                 throw error
+             }
+         }
+--- a/Sources/KakaoCore/Automation/BackgroundWindowSelection.swift
++++ b/Sources/KakaoCore/Automation/BackgroundWindowSelection.swift
+@@ -10,9 +10,12 @@
+         guard !target.isEmpty else {
+             throw AutomationError.sendFailed("background_window_required")
+         }
++        guard !titles.isEmpty else {
++            throw AutomationError.sendFailed("background_windows_unavailable")
++        }
+         let matches = titles.indices.filter { key(titles[$0]) == target }
+         guard !matches.isEmpty else {
+-            throw AutomationError.sendFailed("background_window_required")
++            throw AutomationError.sendFailed("background_window_name_mismatch")
+         }
+         guard matches.count == 1 else {
+             throw AutomationError.sendFailed("background_duplicate_target_windows")
+--- a/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
++++ b/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
+@@ -19,6 +19,9 @@
+ 
+     @Flag(name: .long, help: "Hide KakaoTalk and verify no windows remain on screen")
+     var hide = false
++
++    @Flag(name: .long, help: "Include window titles and control availability; never include message or input contents")
++    var windows = false
+ 
+     func run() throws {
+         guard !prepareInput || chat != nil else {
+@@ -42,6 +45,7 @@
+                 data["chat_list_available"] = false
+             }
+         }
++        if windows { data["windows"] = try automator.windowReport() }
+         if let chat {
+             do {
+                 try automator.checkBackground(to: chat)

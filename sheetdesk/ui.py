@@ -19,6 +19,7 @@ class App:
         self.room_id = None
         self.filter = ""
         self.drafts = {}
+        self.sending_drafts = {}
         self.draft, self.cursor = "", 0
         self.mode = "browse"
         self.focus = "rooms"
@@ -28,6 +29,7 @@ class App:
         self.offset = 0
         self.status = "연결 중…" if not args.demo else "샘플 모드 · 실제 카톡에 접근하지 않습니다"
         self.error = False
+        self.error_kind = None
         self.last_refresh = None
         self.last_poll, self.last_rooms = float("-inf"), float("-inf")
         self.pending = set()
@@ -55,21 +57,23 @@ class App:
             try:
                 self.events.put((kind, context, fn(), None))
             except BackendError as error:
-                self.events.put((kind, context, None, str(error)))
+                self.events.put((kind, context, {"delivery_uncertain": error.delivery_uncertain}, str(error)))
             except Exception:
                 # Never print a traceback with conversation data in locals/arguments.
-                self.events.put((kind, context, None, "처리 중 오류가 발생했습니다. 새로고침하거나 다시 실행하세요."))
+                self.events.put((kind, context, {"delivery_uncertain": kind == "send"}, "처리 중 오류가 발생했습니다. 새로고침하거나 다시 실행하세요."))
         self.pool.submit(worker)
 
     def note(self, text, error=False):
         self.status, self.error, self.dirty = text, error, True
 
     def choose(self, room):
-        if self.allowed_names and room_name_key(room.name) not in self.allowed_names:
-            if not self.room_picker:
-                return
-            self.allowed_names = frozenset([room_name_key(room.name)])
+        # CLI names choose the initial conversation, not a permanent allowlist.
+        # Subsequent choices come from the current room list (including Ctrl+O).
+        if not any(candidate.id == room.id for candidate in self.rooms):
+            return
+        self.allowed_names = frozenset([room_name_key(room.name)])
         if self.room_id == room.id:
+            self.prepare_room(room)
             return
         if self.room_id is not None:
             self.drafts[self.room_id] = self.draft
@@ -82,6 +86,13 @@ class App:
             self.focus = "messages"
         self.last_poll = float("-inf")
         self.note("불러오는 중…")
+        self.prepare_room(room)
+
+    def prepare_room(self, room):
+        if not self.args.demo and not self.args.readonly:
+            self.mode = "opening"
+            self.note("카톡 대화창 준비 중…")
+            self.job("open_room", room.id, lambda: self.backend.focus_room(room))
 
     def collect(self):
         while True:
@@ -90,11 +101,28 @@ class App:
             except queue.Empty:
                 return
             self.pending.discard(kind)
+            if kind == "open_room" and context != self.room_id:
+                continue
             if kind == "messages" and context != self.room_id:
                 continue
             if error:
+                if kind == "send" and (result or {}).get("delivery_uncertain"):
+                    self.sending_drafts.pop(context, None)
+                    self.mode = "compose"
+                    self.last_poll = float("-inf")
+                    self.error_kind = None
+                    self.note("")
+                    continue
                 self.note(error, True)
+                self.error_kind = kind
                 if kind == "send":
+                    text = self.sending_drafts.pop(context, "")
+                    if not (result or {}).get("delivery_uncertain"):
+                        self.drafts[context] = text
+                        if context == self.room_id:
+                            self.draft, self.cursor = text, len(text)
+                    self.mode = "compose"
+                elif kind == "open_room":
                     self.mode = "compose"
                 continue
             if kind == "rooms":
@@ -113,23 +141,25 @@ class App:
                 else:
                     self.room_id, self.messages = None, []
                     self.draft, self.cursor = "", 0
-                    self.note("지정한 이름의 방이 없습니다. 이름을 정확히 확인하고 Ctrl+R로 갱신하세요.")
-                if self.error:
+                    self.note("지정한 이름의 방이 없습니다. Ctrl+O로 전체 방을 검색해 선택하세요.")
+                if self.error and self.error_kind == "rooms":
                     self.note("연결됨")
             elif kind == "messages":
                 self.messages = result
                 self.last_refresh = datetime.now().strftime("%H:%M:%S")
-                if self.mode == "browse" or self.status in ("불러오는 중…", "연결 중…"):
+                if not self.error and (self.mode == "browse" or self.status in ("불러오는 중…", "연결 중…")):
                     self.note("연결됨 · {}개 행".format(len(result)))
             elif kind == "send":
+                self.sending_drafts.pop(context, None)
                 self.drafts[context] = ""
                 if context == self.room_id:
                     self.draft, self.cursor = "", 0
                     self.mode = "compose"
                     self.last_poll = float("-inf")
                 self.note("전송 요청 완료 · 실제 반영은 대화 조회에서 확인합니다")
-            elif kind == "hide":
-                self.note("백그라운드 연결 준비됨")
+            elif kind == "open_room":
+                self.mode = "compose"
+                self.note("연결됨")
             self.dirty = True
 
     def poll(self):
@@ -160,8 +190,6 @@ class App:
             curses.init_pair(2, curses.COLOR_CYAN, -1)
             curses.init_pair(3, curses.COLOR_RED, -1)
         try:
-            if not self.args.demo:
-                self.job("hide", None, self.backend.hide)
             while self.running:
                 self.collect()
                 self.poll()
@@ -186,8 +214,8 @@ class App:
 
     def handle(self, key):
         if key in ("\x03", "\x11"):  # Ctrl+C / Ctrl+Q
-            if "send" in self.pending:
-                self.note("전송 처리 중입니다. 완료 후 종료할 수 있습니다. Ctrl+B로 화면을 가릴 수 있습니다.")
+            if "send" in self.pending or "open_room" in self.pending:
+                self.note("카톡 작업 처리 중입니다. 완료 후 종료할 수 있습니다. Ctrl+B로 화면을 가릴 수 있습니다.")
             else:
                 self.running = False
             return
@@ -211,7 +239,7 @@ class App:
         if self.help:
             self.help = False
             return
-        if self.mode == "sending":
+        if self.mode in ("sending", "opening"):
             return
         if key == "\x0f" and self.view == "console":
             self.room_picker = not self.room_picker
@@ -236,6 +264,8 @@ class App:
                 self.filter = ""
                 self.mode = "browse" if self.args.readonly else "compose"
                 self.focus = "messages"
+                if "open_room" in self.pending:
+                    self.mode = "opening"
             elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
                 self.filter = self.filter[:-1]
                 self.selected = 0
@@ -281,6 +311,9 @@ class App:
                     def deliver():
                         self.backend.prepare(room, text)
                         self.backend.send(room, text)
+                    self.sending_drafts[room.id] = text
+                    self.draft, self.cursor = "", 0
+                    self.drafts[room.id] = ""
                     self.job("send", room.id, deliver)
                     self.mode = "sending"
                     self.note("전송 중…")

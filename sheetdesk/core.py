@@ -12,7 +12,9 @@ import unicodedata
 
 
 class BackendError(Exception):
-    pass
+    def __init__(self, message, delivery_uncertain=False):
+        super().__init__(message)
+        self.delivery_uncertain = delivery_uncertain
 
 
 def room_name_key(name):
@@ -24,19 +26,24 @@ def background_hint(reason):
     hints = {
         "accessibility_permission_denied": "손쉬운 사용 권한 없음: 실행 터미널을 시스템 설정에서 허용하고 재시작하세요.",
         "background_app_not_running": "카톡이 실행 중이어야 합니다. 앱이 자동 실행하지 않습니다.",
+        "background_windows_unavailable": "카톡의 창 목록이 비어 있습니다. 실행 터미널의 손쉬운 사용 권한과 카톡 창 상태를 확인하세요.",
+        "background_window_name_mismatch": "열린 카톡 창 제목과 선택한 방 이름이 일치하지 않습니다. ./run.sh --doctor --windows 로 창 제목을 확인하세요.",
         "background_window_required": "대상 방을 카톡에서 한 번 연 뒤 터미널로 돌아오세요. 방을 자동으로 열지 않습니다.",
-        "background_multiple_windows": "대화 창이 여러 개입니다. 대상 대화 창만 남겨야 백그라운드로 전송할 수 있습니다.",
+        "background_multiple_windows": "이전 CLI가 여러 대화 창을 지원하지 않습니다. ./setup.sh 로 업데이트하세요.",
+        "background_duplicate_target_windows": "같은 이름의 대상 대화 창이 여러 개입니다. 해당 이름의 창만 하나 남겨 주세요.",
         "background_target_mismatch": "열린 대화 창이 선택한 방과 다릅니다. 대상 방만 열어 주세요.",
         "background_window_minimized": "대화 창의 최소화를 풀고 터미널 뒤에 두세요. 자동으로 창을 복원하지 않습니다.",
-        "background_target_not_main": "대상 대화 창의 포커스 자동 지정에 실패했습니다. 창 상태를 다시 확인합니다.",
+        "background_target_not_main": "설치된 CLI가 창의 메인 상태를 요구합니다. ./setup.sh 실행 후 앱을 다시 시작하세요.",
         "background_input_not_focused": "백그라운드 입력 포커스를 지정하지 못했습니다. 수정된 kakaocli 버전을 확인하세요.",
+        "background_send_button_unavailable": "대상 창에서 접근성 전송 버튼을 확인하지 못했습니다. 카톡 버전/UI 확인이 필요합니다. 다른 창에 키를 보내지 않습니다.",
+        "background_send_button_disabled": "대상 창의 전송 버튼이 활성화되지 않았습니다. 입력 내용과 카톡 연결 상태를 확인하세요.",
         "background_focus_failed": "입력 포커스 자동 지정에 실패했습니다. 카톡 UI가 백그라운드 포커스를 허용하지 않는 상태입니다.",
         "background_cannot_hide": "카톡 숨김을 확인하지 못해 중단했습니다. 창을 앞으로 띄우는 전송은 하지 않습니다.",
         "background_became_visible": "카톡의 숨김 상태가 풀려 다시 숨기고 중단했습니다. 자동 재전송하지 않습니다.",
-        "background_existing_draft": "이전 실행 파일의 초안 차단입니다. 앱을 종료하고 수정본으로 다시 실행하세요.",
-        "background_set_value_failed": "백그라운드 입력이 지원되지 않거나 실패했습니다. 원래 카톡 입력창을 확인하세요.",
+        "background_existing_draft": "설치된 CLI가 기존 초안을 처리하지 못합니다. ./setup.sh 실행 후 앱을 다시 시작하세요.",
+        "background_set_value_failed": "카톡 입력 내용을 변경하지 못했습니다. 대상 입력창을 확인하세요.",
         "background_target_changed": "전송 직전 대상 창이 바뀌어 중단했습니다. 카톡 입력창을 확인하세요.",
-        "background_event_failed": "백그라운드 키 이벤트를 만들지 못했습니다. 자동 재전송하지 않습니다.",
+        "background_event_failed": "전송 키 이벤트를 만들지 못했습니다. 자동 재전송하지 않습니다.",
         "background_delivery_unconfirmed": "전송 결과 미확인: 원래 카톡에서 확인하세요. 자동 재전송하지 않습니다.",
     }
     return next((text for code, text in hints.items() if code in str(reason)), "백그라운드 전송 조건을 확인하지 못했습니다. --doctor로 진단하세요.")
@@ -157,15 +164,18 @@ class KakaoBackend:
             raise BackendError("kakaocli가 없습니다. 먼저 ./setup.sh 를 실행하세요.") from None
         except subprocess.TimeoutExpired:
             hint = "전송 결과를 확인하지 못했습니다. 카톡에서 확인 후 재전송하세요." if private else "조회 시간이 초과됐습니다. 권한과 카톡 상태를 확인하세요."
-            raise BackendError(hint) from None
+            raise BackendError(hint, delivery_uncertain=private) from None
         except OSError:
             raise BackendError("kakaocli 실행에 실패했습니다. 경로와 실행 권한을 확인하세요.") from None
         if result.returncode:
             # Send errors can echo the message. Never display those details.
             if private:
                 detail = (result.stderr + result.stdout).lower()
+                if "foreground_focus_failed" in detail:
+                    raise BackendError("대상 창의 입력 포커스를 확인하지 못했습니다. 카톡 창과 접근성 권한을 확인하세요. 자동 재전송하지 않습니다.")
                 if "background_" in detail:
-                    raise BackendError(background_hint(detail))
+                    raise BackendError(background_hint(detail),
+                                       delivery_uncertain="background_delivery_unconfirmed" in detail)
                 if "accessibility_permission_denied" in detail:
                     raise BackendError("손쉬운 사용 권한 없음: 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 실행 터미널을 허용하고 재시작하세요.")
                 if "no open windows" in detail:
@@ -191,8 +201,10 @@ class KakaoBackend:
     def rooms(self):
         return [Room.parse(row) for row in self.json(["chats", "--json", "--limit", "100000"])]
 
-    def diagnostics(self, room_name=None, hide=False):
+    def diagnostics(self, room_name=None, hide=False, windows=False):
         args = ["diagnostics"]
+        if windows:
+            args.append("--windows")
         if hide:
             args.append("--hide")
         if room_name:
@@ -205,14 +217,20 @@ class KakaoBackend:
             raise BackendError("진단 응답 형식이 잘못됐습니다.")
         return result
 
-    def hide(self):
-        status = self.diagnostics(hide=True)
-        if not status.get("hidden"):
-            raise BackendError(background_hint("background_cannot_hide"))
-        return status
-
     def messages(self, room_id, limit=200):
         return ordered_messages(self.json(["messages", "--chat-id", str(room_id), "--limit", str(limit), "--json"]))
+
+    def focus_room(self, room):
+        if self.readonly:
+            return
+        self.validate_target(room)
+        response = self.run(["diagnostics", "--open-chat", "--chat", room.name], private=True)
+        try:
+            prepared = json.loads(response)
+        except ValueError:
+            raise BackendError("대화창 준비 응답을 읽지 못했습니다.") from None
+        if not isinstance(prepared, dict) or not prepared.get("chat_prepared"):
+            raise BackendError("대화창을 열고 입력 포커스를 지정하지 못했습니다.")
 
     def validate_target(self, room):
         if not room.name.strip() or room.name.lower() in ("(unknown)", "unknown"):
@@ -230,11 +248,6 @@ class KakaoBackend:
         if len(text) > 4000 or "\x00" in text:
             raise BackendError("메시지는 4,000자 이하로 입력하세요. NUL 문자는 사용할 수 없습니다.")
         self.validate_target(room)
-        diagnostics = self.diagnostics(room.name, hide=True)
-        if not diagnostics.get("background_ready"):
-            raise BackendError(background_hint(diagnostics.get("background_reason", "")))
-        if not diagnostics.get("hidden"):
-            raise BackendError(background_hint("background_cannot_hide"))
         # The '--' also prevents messages beginning with '-' from becoming CLI flags.
         self.run(["send", "--dry-run", "--exact", "--background", "--message-stdin", "--", room.name], private=True, input_text=text)
 

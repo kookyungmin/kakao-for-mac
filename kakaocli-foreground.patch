@@ -1,0 +1,143 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -146,6 +146,106 @@
+         throw AutomationError.sendFailed("background_delivery_unconfirmed")
+     }
+ 
++    /// Opens or raises only the named chat, preserving every other chat window.
++    public func sendForeground(to chatName: String, message: String) throws {
++        guard AXIsProcessTrusted() else {
++            throw AutomationError.sendFailed("accessibility_permission_denied")
++        }
++        guard let process = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleId).first else {
++            throw AutomationError.sendFailed("background_app_not_running")
++        }
++        let previous = NSWorkspace.shared.frontmostApplication
++        defer {
++            if let previous, previous.processIdentifier != process.processIdentifier,
++               NSWorkspace.shared.frontmostApplication?.processIdentifier == process.processIdentifier {
++                _ = previous.activate()
++            }
++        }
++        _ = process.unhide()
++        _ = process.activate()
++        let app = AXUIElementCreateApplication(process.processIdentifier)
++        func targetWindow() throws -> AXUIElement? {
++            let windows = AXHelpers.windows(app).filter { AXHelpers.role($0) == "AXWindow" }
++            do {
++                return windows[try BackgroundWindowSelection.index(
++                    titles: windows.map { AXHelpers.title($0) ?? "" }, chatName: chatName)]
++            } catch {
++                if String(describing: error).contains("background_window_required") { return nil }
++                throw error
++            }
++        }
++        Thread.sleep(forTimeInterval: 0.3)
++        if try targetWindow() == nil {
++            guard let main = AXHelpers.windows(app).first(where: { AXHelpers.identifier($0) == "Main Window" }) else {
++                throw AutomationError.noWindows
++            }
++            _ = AXUIElementSetAttributeValue(main, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
++            _ = AXHelpers.performAction(main, kAXRaiseAction as String)
++            if let tab = AXHelpers.findFirst(main, role: "AXCheckBox", identifier: "chatrooms") {
++                _ = AXHelpers.performAction(tab, kAXPressAction as String)
++                Thread.sleep(forTimeInterval: 0.3)
++            }
++            guard let table = AXHelpers.chatListTable(main),
++                  let row = AXHelpers.findChatRow(table, chatName: chatName, exact: true) else {
++                throw AutomationError.chatNotFound(chatName)
++            }
++            if let scroll = AXHelpers.chatListScrollArea(main) {
++                _ = AXHelpers.scrollRowToVisible(row, in: scroll)
++            }
++            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == process.processIdentifier else {
++                throw AutomationError.sendFailed("foreground_focus_failed")
++            }
++            AXHelpers.doubleClickElement(row)
++        }
++        var selected: AXUIElement?
++        let deadline = Date().addingTimeInterval(5)
++        while Date() < deadline {
++            if let window = try targetWindow() { selected = window; break }
++            Thread.sleep(forTimeInterval: 0.1)
++        }
++        guard let window = selected, let input = findInputField(in: window) else {
++            throw AutomationError.inputFieldNotFound
++        }
++        _ = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
++        _ = AXHelpers.performAction(window, kAXRaiseAction as String)
++        Thread.sleep(forTimeInterval: 0.2)
++        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == process.processIdentifier else {
++            throw AutomationError.sendFailed("foreground_focus_failed")
++        }
++        AXHelpers.clickElement(input)
++        _ = AXHelpers.focus(input)
++        for _ in 0..<20 {
++            if inputIsFocused(input, pid: process.processIdentifier) { break }
++            Thread.sleep(forTimeInterval: 0.05)
++        }
++        func verifyTarget() throws {
++            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == process.processIdentifier,
++                  let current = try targetWindow(), CFEqual(current, window),
++                  let currentInput = findInputField(in: current), CFEqual(currentInput, input),
++                  inputIsFocused(input, pid: process.processIdentifier) else {
++                throw AutomationError.sendFailed("foreground_focus_failed")
++            }
++        }
++        try verifyTarget()
++        try BackgroundDraftTransaction.replaceAndDispatch(
++            message: message, read: { AXHelpers.value(input) },
++            write: { AXHelpers.setValue(input, $0) }, dispatch: {
++                try verifyTarget()
++                guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
++                      let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false) else {
++                    throw AutomationError.sendFailed("background_event_failed")
++                }
++                down.postToPid(process.processIdentifier)
++                up.postToPid(process.processIdentifier)
++            })
++        let sentDeadline = Date().addingTimeInterval(2)
++        while Date() < sentDeadline {
++            if (AXHelpers.value(input) ?? message).isEmpty { return }
++            Thread.sleep(forTimeInterval: 0.1)
++        }
++        throw AutomationError.sendFailed("background_delivery_unconfirmed")
++    }
++
+     /// Send a message to a chat by navigating the UI.
+     public func sendMessage(to chatName: String, message: String, selfChat: Bool = false, exact: Bool = false) throws {
+         guard AXIsProcessTrusted() else {
+--- a/Sources/KakaoCLI/Commands/SendCommand.swift
++++ b/Sources/KakaoCLI/Commands/SendCommand.swift
+@@ -29,6 +29,9 @@
+     @Flag(name: .long, help: "Use only an existing, verified chat window; never activate or open KakaoTalk")
+     var background = false
+ 
++    @Flag(name: .long, help: "Activate and focus the exact chat, opening it if needed; preserve other windows")
++    var foreground = false
++
+     func run() throws {
+         let payload: String
+         if messageStdin {
+@@ -47,8 +50,8 @@
+         }
+         let automator = KakaoAutomator()
+         let target = selfChat ? "self-chat" : chat
+-        guard background, exact, !selfChat else {
+-            throw ValidationError("This build requires --background --exact and does not support --me.")
++        guard background != foreground, exact, !selfChat else {
++            throw ValidationError("Use --exact and exactly one of --foreground or --background; --me is unsupported.")
+         }
+         if dryRun {
+             print("DRY RUN: Would send to '\(target)': \(payload)")
+@@ -63,7 +66,9 @@
+                 throw ValidationError("Exact chat name must match one room; found \(matches.count). Rename duplicate rooms in KakaoTalk first.")
+             }
+         }
+-        if background {
++        if foreground {
++            try automator.sendForeground(to: chat, message: payload)
++        } else if background {
+             guard !selfChat, exact else {
+                 throw ValidationError("Background mode requires --exact and does not support --me.")
+             }

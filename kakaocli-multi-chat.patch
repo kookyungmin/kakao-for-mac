@@ -1,0 +1,146 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -41,7 +41,7 @@
+     }
+ 
+     /// Never activates, opens, raises, clicks, or changes the selected chat.
+-    /// Refuses to act unless the sole existing input window is the named main window.
++    /// Selects a unique named window even when other chat windows are open.
+     private func backgroundTarget(to chatName: String) throws -> (pid_t, AXUIElement, AXUIElement) {
+         guard AXIsProcessTrusted() else {
+             throw AutomationError.sendFailed("accessibility_permission_denied")
+@@ -51,26 +51,15 @@
+         }
+         try requireHidden()
+         let app = AXUIElementCreateApplication(process.processIdentifier)
+-        let candidates = AXHelpers.windows(app).compactMap { window -> (AXUIElement, AXUIElement)? in
+-            guard AXHelpers.role(window) == "AXWindow", let input = findInputField(in: window) else { return nil }
+-            return (window, input)
+-        }
+-        guard !candidates.isEmpty else {
+-            throw AutomationError.sendFailed("background_window_required")
+-        }
+-        guard candidates.count == 1 else {
+-            throw AutomationError.sendFailed("background_multiple_windows")
+-        }
+-        let (window, input) = candidates[0]
+-        let compact: (String) -> String = { $0.filter { !$0.isWhitespace }.precomposedStringWithCanonicalMapping }
+-        guard compact(AXHelpers.title(window) ?? "") == compact(chatName) else {
+-            throw AutomationError.sendFailed("background_target_mismatch")
++        let windows = AXHelpers.windows(app).filter { AXHelpers.role($0) == "AXWindow" }
++        let index = try BackgroundWindowSelection.index(
++            titles: windows.map { AXHelpers.title($0) ?? "" }, chatName: chatName)
++        let window = windows[index]
++        guard let input = findInputField(in: window) else {
++            throw AutomationError.inputFieldNotFound
+         }
+         guard AXHelpers.boolAttribute(window, kAXMinimizedAttribute as String) != true else {
+             throw AutomationError.sendFailed("background_window_minimized")
+-        }
+-        guard AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true else {
+-            throw AutomationError.sendFailed("background_target_not_main")
+         }
+         guard (AXHelpers.value(input) ?? "").isEmpty else {
+             throw AutomationError.sendFailed("background_existing_draft")
+@@ -89,7 +78,18 @@
+             && focused.map { CFEqual($0, input) } == true
+     }
+ 
+-    private func focusBackgroundInput(_ input: AXUIElement, pid: pid_t) throws {
++    private func focusBackgroundInput(_ input: AXUIElement, window: AXUIElement, pid: pid_t) throws {
++        try requireHidden()
++        if AXHelpers.boolAttribute(window, kAXMainAttribute as String) != true {
++            // Select the existing window inside the hidden app; never raise or activate it.
++            _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
++            let app = AXUIElementCreateApplication(pid)
++            _ = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, window)
++        }
++        try requireHidden()
++        guard AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true else {
++            throw AutomationError.sendFailed("background_target_not_main")
++        }
+         if inputIsFocused(input, pid: pid) { return }
+         // Change the responder inside the existing app without clicks, raises,
+         // application activation, or global keyboard events.
+@@ -107,15 +107,15 @@
+ 
+     /// Sets only the existing input's AX focus. Does not type or send anything.
+     public func prepareBackgroundInput(to chatName: String) throws {
+-        let (pid, _, input) = try backgroundTarget(to: chatName)
+-        try focusBackgroundInput(input, pid: pid)
++        let (pid, window, input) = try backgroundTarget(to: chatName)
++        try focusBackgroundInput(input, window: window, pid: pid)
+         try requireHidden()
+     }
+ 
+     public func sendBackground(to chatName: String, message: String) throws {
+         try hideApplication()
+         let (pid, window, input) = try backgroundTarget(to: chatName)
+-        try focusBackgroundInput(input, pid: pid)
++        try focusBackgroundInput(input, window: window, pid: pid)
+         let (_, checkedWindow, checkedInput) = try backgroundTarget(to: chatName)
+         guard CFEqual(window, checkedWindow), CFEqual(input, checkedInput) else {
+             throw AutomationError.sendFailed("background_target_changed")
+--- /dev/null
++++ b/Sources/KakaoCore/Automation/BackgroundWindowSelection.swift
+@@ -0,0 +1,22 @@
++import Foundation
++
++/// Selection is independent of window ordering and the app's current main window.
++enum BackgroundWindowSelection {
++    static func index(titles: [String], chatName: String) throws -> Int {
++        func key(_ name: String) -> String {
++            name.filter { !$0.isWhitespace }.precomposedStringWithCanonicalMapping
++        }
++        let target = key(chatName)
++        guard !target.isEmpty else {
++            throw AutomationError.sendFailed("background_window_required")
++        }
++        let matches = titles.indices.filter { key(titles[$0]) == target }
++        guard !matches.isEmpty else {
++            throw AutomationError.sendFailed("background_window_required")
++        }
++        guard matches.count == 1 else {
++            throw AutomationError.sendFailed("background_duplicate_target_windows")
++        }
++        return matches[0]
++    }
++}
+--- /dev/null
++++ b/Tests/KakaoCoreTests/BackgroundWindowSelectionTests.swift
+@@ -0,0 +1,35 @@
++import Foundation
++import Testing
++@testable import KakaoCore
++
++struct BackgroundWindowSelectionTests {
++    @Test func selectsTargetAmongOtherChatAndNotificationWindows() throws {
++        #expect(try BackgroundWindowSelection.index(
++            titles: ["다른 방", "알림", "경 민", "카카오톡"], chatName: "경민") == 2)
++        #expect(try BackgroundWindowSelection.index(
++            titles: ["경민", "다른 방"], chatName: "경민") == 0)
++    }
++
++    @Test func rejectsMissingAndSubstringOnlyTargets() {
++        for titles in [[], ["경민 회사", "다른 방"]] as [[String]] {
++            #expect(throws: (any Error).self) {
++                try BackgroundWindowSelection.index(titles: titles, chatName: "경민")
++            }
++        }
++    }
++
++    @Test func rejectsAmbiguousNamesAfterWhitespaceNormalization() {
++        #expect(throws: (any Error).self) {
++            try BackgroundWindowSelection.index(
++                titles: ["경 민", "다른 방", "경민"], chatName: "경민")
++        }
++    }
++
++    @Test func normalizesUnicodeAndRejectsBlankTarget() throws {
++        #expect(try BackgroundWindowSelection.index(
++            titles: ["경민".decomposedStringWithCanonicalMapping], chatName: "경민") == 0)
++        #expect(throws: (any Error).self) {
++            try BackgroundWindowSelection.index(titles: [""], chatName: " ")
++        }
++    }
++}

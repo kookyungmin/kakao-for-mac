@@ -77,13 +77,15 @@ class BackendTests(unittest.TestCase):
                 self.backend.send(self.room, "안녕")
             run.assert_called_once_with(["send", "--help"])
 
-    def test_background_not_ready_blocks_preview_without_send(self):
+    def test_prepare_does_not_hide_or_require_background_focus(self):
         with patch.object(self.backend, "rooms", return_value=[self.room]), \
-             patch.object(self.backend, "diagnostics", return_value={"background_ready":False,"background_reason":"background_window_required"}), \
+             patch.object(self.backend, "diagnostics") as diagnostics, \
              patch.object(self.backend, "run") as run:
-            with self.assertRaisesRegex(BackendError, "자동으로 열지"):
-                self.backend.prepare(self.room, "안녕")
-            run.assert_not_called()
+            self.backend.prepare(self.room, "안녕")
+            diagnostics.assert_not_called()
+            run.assert_called_once_with(
+                ["send", "--dry-run", "--exact", "--background", "--message-stdin", "--", self.room.name],
+                private=True, input_text="안녕")
 
     def test_send_without_background_capability_is_blocked(self):
         with patch.object(self.backend, "rooms", return_value=[self.room]), \
@@ -92,14 +94,12 @@ class BackendTests(unittest.TestCase):
                 self.backend.send(self.room, "안녕")
             run.assert_called_once_with(["send", "--help"])
 
-    def test_prepare_hides_app_and_rejects_visible_state(self):
+    def test_foreground_only_cli_is_blocked(self):
         with patch.object(self.backend, "rooms", return_value=[self.room]), \
-             patch.object(self.backend, "diagnostics", return_value={"background_ready":True,"hidden":False}) as diagnostics, \
-             patch.object(self.backend, "run") as run:
-            with self.assertRaisesRegex(BackendError, "숨김"):
-                self.backend.prepare(self.room, "안녕")
-            diagnostics.assert_called_once_with(self.room.name, hide=True)
-            run.assert_not_called()
+             patch.object(self.backend, "run", return_value="--exact --message-stdin --foreground") as run:
+            with self.assertRaises(BackendError):
+                self.backend.send(self.room, "안녕")
+            run.assert_called_once_with(["send", "--help"])
 
     def test_two_second_rate_limit(self):
         self.backend._last_send = 100
@@ -107,6 +107,25 @@ class BackendTests(unittest.TestCase):
              patch.object(self.backend, "run") as run:
             with self.assertRaises(BackendError):
                 self.backend.send(self.room, "안녕")
+            run.assert_not_called()
+
+    def test_window_report_is_explicit_and_passes_selected_room(self):
+        with patch.object(self.backend, "run", return_value='{"windows":[]}') as run:
+            self.assertEqual(self.backend.diagnostics("경민", windows=True), {"windows": []})
+            run.assert_called_once_with(["diagnostics", "--windows", "--chat", "경민"])
+
+    def test_focus_room_validates_target_and_never_sends_message(self):
+        with patch.object(self.backend, "rooms", return_value=[self.room]), \
+             patch.object(self.backend, "run", return_value='{"chat_prepared":true}') as run:
+            self.backend.focus_room(self.room)
+            run.assert_called_once_with(
+                ["diagnostics", "--open-chat", "--chat", self.room.name], private=True)
+
+    def test_duplicate_room_cannot_be_automatically_opened(self):
+        with patch.object(self.backend, "rooms", return_value=[self.room, Room("2", self.room.name)]), \
+             patch.object(self.backend, "run") as run:
+            with self.assertRaises(BackendError):
+                self.backend.focus_room(self.room)
             run.assert_not_called()
 
     def test_private_error_does_not_echo_message(self):
@@ -204,8 +223,32 @@ class UITests(unittest.TestCase):
                 prepare.assert_called_once_with(self.app.room, "초안")
                 send.assert_called_once_with(self.app.room, "초안")
             self.assertEqual(self.app.mode, "sending")
+            self.assertEqual(self.app.draft, "")
+            self.assertEqual(self.app.cursor, 0)
             self.app.handle("\n")
             self.assertEqual(job.call_count, 1)
+
+    def test_failed_send_restores_unsent_draft(self):
+        self.app.mode, self.app.draft = "compose", "보낼 내용"
+        with patch.object(self.app, "job"):
+            self.app.handle("\n")
+        self.app.events.put(("send", self.app.room_id, {"delivery_uncertain": False}, "입력 실패"))
+        self.app.collect()
+        self.assertEqual(self.app.draft, "보낼 내용")
+        self.assertEqual(self.app.cursor, len("보낼 내용"))
+
+    def test_uncertain_send_leaves_input_empty_without_status_warning(self):
+        self.app.mode, self.app.draft = "compose", "이미 보냈을 수 있는 내용"
+        with patch.object(self.app, "job"):
+            self.app.handle("\n")
+        self.app.events.put(("send", self.app.room_id, {"delivery_uncertain": True}, "전송 결과 미확인"))
+        self.app.collect()
+        self.assertEqual(self.app.draft, "")
+        self.app.events.put(("rooms", None, list(self.app.rooms), None))
+        self.app.events.put(("messages", self.app.room_id, [], None))
+        self.app.collect()
+        self.assertFalse(self.app.error)
+        self.assertEqual(self.app.status, "")
 
     def test_enter_with_empty_draft_does_not_send(self):
         self.app.mode, self.app.draft = "compose", "   "
@@ -278,6 +321,81 @@ class ConsoleTests(unittest.TestCase):
         self.app.handle("\x1b")
         self.assertEqual(self.app.room_id, "1")
         self.assertEqual(self.app.visible_rooms, [self.room])
+
+    def test_picker_switch_refresh_poll_and_send_use_new_room(self):
+        other = Room("2", "다른 친구")
+        rooms = [self.room, other]
+        self.app.events.put(("rooms", None, rooms, None))
+        self.app.collect()
+        self.app.draft = "원래 방 초안"
+        self.app.handle("\x0f")
+        for key in "친구":
+            self.app.handle(key)
+        self.app.handle("\n")
+        self.assertEqual(self.app.room, other)
+        self.assertEqual(self.app.draft, "")
+        self.app.events.put(("rooms", None, list(reversed(rooms)), None))
+        self.app.events.put(("messages", self.room.id, [Message("1", "", "", "이전 방 응답")], None))
+        self.app.collect()
+        self.assertEqual(self.app.room, other)
+        self.assertEqual(self.app.messages, [])
+        with patch.object(self.app, "job") as job, patch.object(self.app.backend, "messages") as messages:
+            self.app.poll()
+            request = next(call for call in job.call_args_list if call.args[0] == "messages")
+            self.assertEqual(request.args[1], other.id)
+            request.args[2]()
+            messages.assert_called_once_with(other.id)
+        self.app.draft = "새 방 답장"
+        with patch.object(self.app, "job") as job, \
+             patch.object(self.app.backend, "prepare") as prepare, \
+             patch.object(self.app.backend, "send") as send:
+            self.app.handle("\n")
+            job.call_args.args[2]()
+            prepare.assert_called_once_with(other, "새 방 답장")
+            send.assert_called_once_with(other, "새 방 답장")
+        self.app.events.put(("send", other.id, None, None))
+        self.app.collect()
+        self.app.handle("\x0f")
+        for key in "김도완":
+            self.app.handle(key)
+        self.app.handle("\n")
+        self.assertEqual(self.app.room, self.room)
+        self.assertEqual(self.app.draft, "원래 방 초안")
+
+    def test_missing_initial_room_can_be_recovered_with_picker(self):
+        other = Room("2", "다른 친구")
+        self.app.events.put(("rooms", None, [other], None))
+        self.app.collect()
+        self.assertIsNone(self.app.room)
+        self.app.handle("\x0f")
+        self.app.handle("\n")
+        self.assertEqual(self.app.room, other)
+        self.assertEqual(self.app.mode, "compose")
+
+    def test_live_picker_prepares_selected_window_before_allowing_send(self):
+        other = Room("2", "다른 친구")
+        self.app.events.put(("rooms", None, [self.room, other], None))
+        self.app.collect()
+        self.app.args.demo = False
+        self.app.handle("\x0f")
+        self.app.handle(curses.KEY_DOWN)
+        requests = []
+        def job(kind, context, fn):
+            self.app.pending.add(kind)
+            requests.append((kind, context, fn))
+        with patch.object(self.app, "job", side_effect=job), \
+             patch.object(self.app.backend, "focus_room", create=True) as focus:
+            self.app.handle("\n")
+            self.assertEqual(self.app.mode, "opening")
+            self.assertEqual(requests[0][:2], ("open_room", other.id))
+            requests[0][2]()
+            focus.assert_called_once_with(other)
+            self.app.handle("\n")
+            self.assertEqual(len(requests), 1)
+        self.app.events.put(("open_room", other.id, None, None))
+        self.app.collect()
+        self.assertEqual(self.app.mode, "compose")
+        self.assertEqual(self.app.room, other)
 
     def test_spacing_variant_is_allowed_but_keeps_actual_send_name(self):
         actual = Room("9", "김 도완")
