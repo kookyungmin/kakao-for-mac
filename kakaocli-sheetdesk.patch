@@ -1,0 +1,299 @@
+diff --git a/Sources/KakaoCLI/Commands/SendCommand.swift b/Sources/KakaoCLI/Commands/SendCommand.swift
+index 305f26e..22fcdf4 100644
+--- a/Sources/KakaoCLI/Commands/SendCommand.swift
++++ b/Sources/KakaoCLI/Commands/SendCommand.swift
+@@ -12,7 +12,10 @@ struct SendCommand: ParsableCommand {
+     var chat: String
+ 
+     @Argument(help: "Message text to send")
+-    var message: String
++    var message: String = ""
++
++    @Flag(name: .long, help: "Read the message from stdin instead of process arguments")
++    var messageStdin = false
+ 
+     @Flag(name: [.customLong("me")], help: "Send to self-chat (나와의 채팅) regardless of chat argument")
+     var selfChat = false
+@@ -20,15 +23,51 @@ struct SendCommand: ParsableCommand {
+     @Flag(name: .long, help: "Show what would happen without actually sending")
+     var dryRun = false
+ 
++    @Flag(name: .long, help: "Require an exact, unique chat display name")
++    var exact = false
++
++    @Flag(name: .long, help: "Use only an existing, verified chat window; never activate or open KakaoTalk")
++    var background = false
++
+     func run() throws {
++        let payload: String
++        if messageStdin {
++            guard message.isEmpty else {
++                throw ValidationError("Use stdin or a message argument, not both.")
++            }
++            guard let input = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) else {
++                throw ValidationError("stdin must contain UTF-8 text.")
++            }
++            payload = input
++        } else {
++            payload = message
++        }
++        guard !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
++            throw ValidationError("Message must not be empty.")
++        }
+         let automator = KakaoAutomator()
+         let target = selfChat ? "self-chat" : chat
+         if dryRun {
+-            print("DRY RUN: Would send to '\(target)': \(message)")
+-            print("Steps: activate KakaoTalk → find chat '\(target)' → type message → press Enter")
++            print("DRY RUN: Would send to '\(target)': \(payload)")
++            print(background ? "Background only: verify existing named window → AX set value → targeted Return" : "Steps: activate KakaoTalk → find chat '\(target)' → type message → press Enter")
+             return
+         }
+-        try automator.sendMessage(to: chat, message: message, selfChat: selfChat)
++        if exact && !selfChat {
++            let reader = try openDatabase(dbPath: nil, key: nil)
++            defer { reader.close() }
++            let matches = try reader.chats(limit: 100000).filter { $0.displayName == chat }
++            guard matches.count == 1 else {
++                throw ValidationError("Exact chat name must match one room; found \(matches.count). Rename duplicate rooms in KakaoTalk first.")
++            }
++        }
++        if background {
++            guard !selfChat, exact else {
++                throw ValidationError("Background mode requires --exact and does not support --me.")
++            }
++            try automator.sendBackground(to: chat, message: payload)
++        } else {
++            try automator.sendMessage(to: chat, message: payload, selfChat: selfChat, exact: exact)
++        }
+         print("Message sent to '\(target)'.")
+     }
+ }
+diff --git a/Sources/KakaoCLI/KakaoCLI.swift b/Sources/KakaoCLI/KakaoCLI.swift
+index 08ae935..49944cc 100644
+--- a/Sources/KakaoCLI/KakaoCLI.swift
++++ b/Sources/KakaoCLI/KakaoCLI.swift
+@@ -9,6 +9,7 @@ struct KakaoCLI: ParsableCommand {
+         subcommands: [
+             AuthCommand.self,
+             ChatsCommand.self,
++            DiagnosticsCommand.self,
+             HarvestCommand.self,
+             InspectCommand.self,
+             LoginCommand.self,
+diff --git a/Sources/KakaoCore/Automation/KakaoAutomator.swift b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+index 8967c41..97a7e29 100644
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -8,8 +8,110 @@ public final class KakaoAutomator {
+ 
+     public init() {}
+ 
++    /// Never activates, opens, raises, clicks, or changes the selected chat.
++    /// Refuses to act unless the sole existing input window is the named main window.
++    private func backgroundTarget(to chatName: String) throws -> (pid_t, AXUIElement, AXUIElement) {
++        guard AXIsProcessTrusted() else {
++            throw AutomationError.sendFailed("accessibility_permission_denied")
++        }
++        guard let process = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleId).first else {
++            throw AutomationError.sendFailed("background_app_not_running")
++        }
++        let app = AXUIElementCreateApplication(process.processIdentifier)
++        let candidates = AXHelpers.windows(app).compactMap { window -> (AXUIElement, AXUIElement)? in
++            guard AXHelpers.role(window) == "AXWindow", let input = findInputField(in: window) else { return nil }
++            return (window, input)
++        }
++        guard !candidates.isEmpty else {
++            throw AutomationError.sendFailed("background_window_required")
++        }
++        guard candidates.count == 1 else {
++            throw AutomationError.sendFailed("background_multiple_windows")
++        }
++        let (window, input) = candidates[0]
++        let compact: (String) -> String = { $0.filter { !$0.isWhitespace }.precomposedStringWithCanonicalMapping }
++        guard compact(AXHelpers.title(window) ?? "") == compact(chatName) else {
++            throw AutomationError.sendFailed("background_target_mismatch")
++        }
++        guard AXHelpers.boolAttribute(window, kAXMinimizedAttribute as String) != true else {
++            throw AutomationError.sendFailed("background_window_minimized")
++        }
++        guard AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true else {
++            throw AutomationError.sendFailed("background_target_not_main")
++        }
++        guard (AXHelpers.value(input) ?? "").isEmpty else {
++            throw AutomationError.sendFailed("background_existing_draft")
++        }
++        return (process.processIdentifier, window, input)
++    }
++
++    public func checkBackground(to chatName: String) throws {
++        _ = try backgroundTarget(to: chatName)
++    }
++
++    private func inputIsFocused(_ input: AXUIElement, pid: pid_t) -> Bool {
++        let app = AXUIElementCreateApplication(pid)
++        var focused: AnyObject?
++        return AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focused) == .success
++            && focused.map { CFEqual($0, input) } == true
++    }
++
++    private func focusBackgroundInput(_ input: AXUIElement, pid: pid_t) throws {
++        if inputIsFocused(input, pid: pid) { return }
++        // Change the responder inside the existing app without clicks, raises,
++        // application activation, or global keyboard events.
++        _ = AXHelpers.focus(input)
++        if !inputIsFocused(input, pid: pid) {
++            let app = AXUIElementCreateApplication(pid)
++            _ = AXUIElementSetAttributeValue(app, kAXFocusedUIElementAttribute as CFString, input)
++        }
++        for _ in 0..<5 {
++            if inputIsFocused(input, pid: pid) { return }
++            Thread.sleep(forTimeInterval: 0.05)
++        }
++        throw AutomationError.sendFailed("background_focus_failed")
++    }
++
++    /// Sets only the existing input's AX focus. Does not type or send anything.
++    public func prepareBackgroundInput(to chatName: String) throws {
++        let (pid, _, input) = try backgroundTarget(to: chatName)
++        try focusBackgroundInput(input, pid: pid)
++    }
++
++    public func sendBackground(to chatName: String, message: String) throws {
++        let (pid, window, input) = try backgroundTarget(to: chatName)
++        try focusBackgroundInput(input, pid: pid)
++        let (_, checkedWindow, checkedInput) = try backgroundTarget(to: chatName)
++        guard CFEqual(window, checkedWindow), CFEqual(input, checkedInput) else {
++            throw AutomationError.sendFailed("background_target_changed")
++        }
++        guard AXHelpers.setValue(input, message), AXHelpers.value(input) == message else {
++            throw AutomationError.sendFailed("background_set_value_failed")
++        }
++        // Recheck the target immediately before dispatch; no global keyboard events.
++        guard AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true,
++              inputIsFocused(input, pid: pid) else {
++            throw AutomationError.sendFailed("background_target_changed")
++        }
++        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
++              let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false) else {
++            throw AutomationError.sendFailed("background_event_failed")
++        }
++        down.postToPid(pid)
++        up.postToPid(pid)
++        let deadline = Date().addingTimeInterval(2)
++        while Date() < deadline {
++            Thread.sleep(forTimeInterval: 0.1)
++            if (AXHelpers.value(input) ?? message).isEmpty { return }
++        }
++        throw AutomationError.sendFailed("background_delivery_unconfirmed")
++    }
++
+     /// Send a message to a chat by navigating the UI.
+-    public func sendMessage(to chatName: String, message: String, selfChat: Bool = false) throws {
++    public func sendMessage(to chatName: String, message: String, selfChat: Bool = false, exact: Bool = false) throws {
++        guard AXIsProcessTrusted() else {
++            throw AutomationError.sendFailed("accessibility_permission_denied")
++        }
+         // 1. Ensure KakaoTalk is running and logged in
+         let stateBefore = AppLifecycle.detectState()
+         try AppLifecycle.ensureReady(credentials: CredentialStore())
+@@ -52,7 +154,7 @@ public final class KakaoAutomator {
+             }
+             row = selfRow
+         } else {
+-            guard let chatRow = AXHelpers.findChatRow(table, chatName: chatName) else {
++            guard let chatRow = AXHelpers.findChatRow(table, chatName: chatName, exact: exact) else {
+                 throw AutomationError.chatNotFound(chatName)
+             }
+             row = chatRow
+diff --git a/Sources/KakaoCore/Database/DeviceInfo.swift b/Sources/KakaoCore/Database/DeviceInfo.swift
+index 4d5a29e..e7178ff 100644
+--- a/Sources/KakaoCore/Database/DeviceInfo.swift
++++ b/Sources/KakaoCore/Database/DeviceInfo.swift
+@@ -57,6 +57,21 @@ public enum DeviceInfo {
+     /// 3. Recover userId by reversing SHA-512 hash from plist revision keys
+     /// 4. FSChatWindowFrame_ common suffix
+     public static func userId() throws -> Int {
++        // Sheetdesk stores only a verified numeric account ID, never DB keys/messages.
++        // Bind the cache to the current account hash so account switching invalidates it.
++        if let cachePath = ProcessInfo.processInfo.environment["SHEETDESK_ACCOUNT_CACHE"],
++           let data = try? Data(contentsOf: URL(fileURLWithPath: cachePath)),
++           let cache = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++           let cachedId = cache["user_id"] as? Int,
++           let cachedHash = cache["account_hash"] as? String,
++           cachedHash == activeAccountHash() {
++            let bytes = Array(String(cachedId).utf8)
++            var digest = [UInt8](repeating: 0, count: Int(CC_SHA512_DIGEST_LENGTH))
++            CC_SHA512(bytes, CC_LONG(bytes.count), &digest)
++            if digest.map({ String(format: "%02x", $0) }).joined() == cachedHash {
++                return cachedId
++            }
++        }
+         let plistPaths = [containerPreferencesPath, preferencesPath]
+         for plistPath in plistPaths {
+             guard FileManager.default.fileExists(atPath: plistPath) else { continue }
+diff --git a/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift b/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
+new file mode 100644
+index 0000000..d776602
+--- /dev/null
++++ b/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
+@@ -0,0 +1,59 @@
++import ArgumentParser
++import AppKit
++import ApplicationServices
++import Foundation
++import KakaoCore
++
++/// Read-only diagnostics: no activation, login, window changes, or message values.
++struct DiagnosticsCommand: ParsableCommand {
++    static let configuration = CommandConfiguration(
++        commandName: "diagnostics",
++        abstract: "Check accessibility and window availability without sending or opening anything"
++    )
++
++    @Option(name: .long, help: "Check whether an exact chat name is visible (name is not printed)")
++    var chat: String?
++
++    @Flag(name: .long, help: "Set focus inside an existing verified chat window; never type, send, or activate the app")
++    var prepareInput = false
++
++    func run() throws {
++        guard !prepareInput || chat != nil else {
++            throw ValidationError("--prepare-input requires --chat.")
++        }
++        let running = !NSRunningApplication.runningApplications(withBundleIdentifier: KakaoAutomator.bundleId).isEmpty
++        let trusted = AXIsProcessTrusted()
++        var data: [String: Any] = ["running": running, "accessibility": trusted]
++        if running && trusted, let app = try? AXHelpers.appElement(bundleId: KakaoAutomator.bundleId) {
++            let windows = AXHelpers.windows(app)
++            data["window_count"] = windows.count
++            if let main = windows.first(where: { AXHelpers.identifier($0) == "Main Window" }),
++               let table = AXHelpers.chatListTable(main) {
++                data["chat_list_available"] = true
++                if let chat {
++                    data["exact_room_visible"] = AXHelpers.findChatRow(table, chatName: chat, exact: true) != nil
++                }
++            } else {
++                data["chat_list_available"] = false
++            }
++        }
++        if let chat {
++            do {
++                let automator = KakaoAutomator()
++                try automator.checkBackground(to: chat)
++                if prepareInput {
++                    let before = NSWorkspace.shared.frontmostApplication?.processIdentifier
++                    try automator.prepareBackgroundInput(to: chat)
++                    data["input_focus_prepared"] = true
++                    data["frontmost_unchanged"] = before == NSWorkspace.shared.frontmostApplication?.processIdentifier
++                }
++                data["background_ready"] = true
++            } catch {
++                data["background_ready"] = false
++                data["background_reason"] = String(describing: error)
++            }
++        }
++        let json = try JSONSerialization.data(withJSONObject: data, options: [.sortedKeys])
++        print(String(decoding: json, as: UTF8.self))
++    }
++}
