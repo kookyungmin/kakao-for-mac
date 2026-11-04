@@ -1,6 +1,7 @@
 import argparse
 import curses
 import locale
+import shutil
 import sys
 
 from .core import KakaoBackend, DemoBackend, BackendError, room_name_key, background_hint
@@ -25,6 +26,10 @@ def main():
     if args.interval < 1:
         parser.error("--interval 은 1초 이상이어야 합니다.")
     backend = DemoBackend() if args.demo else KakaoBackend(args.cli, args.readonly)
+    if not args.demo and shutil.which(backend.executable) is None:
+        print("kakaocli 실행 파일을 찾거나 실행할 수 없습니다: {}".format(backend.executable), file=sys.stderr)
+        print("./setup.sh 를 실행하고 빌드가 성공했는지 확인하세요.", file=sys.stderr)
+        return 1
     if args.doctor:
         try:
             rooms = backend.rooms()
