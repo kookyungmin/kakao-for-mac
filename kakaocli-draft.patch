@@ -1,0 +1,83 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -61,9 +61,6 @@
+         guard AXHelpers.boolAttribute(window, kAXMinimizedAttribute as String) != true else {
+             throw AutomationError.sendFailed("background_window_minimized")
+         }
+-        guard (AXHelpers.value(input) ?? "").isEmpty else {
+-            throw AutomationError.sendFailed("background_existing_draft")
+-        }
+         return (process.processIdentifier, window, input)
+     }
+ 
+@@ -121,21 +118,26 @@
+             throw AutomationError.sendFailed("background_target_changed")
+         }
+         try requireHidden()
+-        guard AXHelpers.setValue(input, message), AXHelpers.value(input) == message else {
+-            throw AutomationError.sendFailed("background_set_value_failed")
+-        }
+-        // Recheck the target immediately before dispatch; no global keyboard events.
+-        guard AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true,
+-              inputIsFocused(input, pid: pid) else {
+-            throw AutomationError.sendFailed("background_target_changed")
+-        }
+-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
+-              let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false) else {
+-            throw AutomationError.sendFailed("background_event_failed")
+-        }
+-        try requireHidden()
+-        down.postToPid(pid)
+-        up.postToPid(pid)
++        try BackgroundDraftTransaction.replaceAndDispatch(
++            message: message,
++            read: { AXHelpers.value(input) },
++            write: { AXHelpers.setValue(input, $0) },
++            dispatch: {
++                // Verify the exact same target after editing, before targeted Return.
++                let (_, currentWindow, currentInput) = try self.backgroundTarget(to: chatName)
++                guard CFEqual(window, currentWindow), CFEqual(input, currentInput),
++                      AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true,
++                      self.inputIsFocused(input, pid: pid) else {
++                    throw AutomationError.sendFailed("background_target_changed")
++                }
++                guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
++                      let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false) else {
++                    throw AutomationError.sendFailed("background_event_failed")
++                }
++                try self.requireHidden()
++                down.postToPid(pid)
++                up.postToPid(pid)
++            })
+         let deadline = Date().addingTimeInterval(2)
+         while Date() < deadline {
+             Thread.sleep(forTimeInterval: 0.1)
+--- /dev/null
++++ b/Sources/KakaoCore/Automation/BackgroundDraftTransaction.swift
+@@ -0,0 +1,26 @@
++import Foundation
++
++/// Restores an overwritten draft only before Return dispatch and only if untouched.
++enum BackgroundDraftTransaction {
++    static func replaceAndDispatch(
++        message: String,
++        read: () -> String?,
++        write: (String) -> Bool,
++        dispatch: () throws -> Void
++    ) throws {
++        guard let previous = read() else {
++            throw AutomationError.sendFailed("background_set_value_failed")
++        }
++        var dispatched = false
++        defer {
++            if !dispatched, read() == message {
++                _ = write(previous)
++            }
++        }
++        guard write(message), read() == message else {
++            throw AutomationError.sendFailed("background_set_value_failed")
++        }
++        try dispatch()
++        dispatched = true
++    }
++}

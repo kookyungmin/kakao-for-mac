@@ -1,0 +1,130 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -49,7 +49,6 @@
+         guard let process = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleId).first else {
+             throw AutomationError.sendFailed("background_app_not_running")
+         }
+-        try requireHidden()
+         let app = AXUIElementCreateApplication(process.processIdentifier)
+         let windows = AXHelpers.windows(app).filter { AXHelpers.role($0) == "AXWindow" }
+         let index = try BackgroundWindowSelection.index(
+@@ -109,41 +108,67 @@
+         try requireHidden()
+     }
+ 
++    /// Sends through the exact window's accessible button, without moving focus.
+     public func sendBackground(to chatName: String, message: String) throws {
+-        try hideApplication()
+-        let (pid, window, input) = try backgroundTarget(to: chatName)
+-        try focusBackgroundInput(input, window: window, pid: pid)
+-        let (_, checkedWindow, checkedInput) = try backgroundTarget(to: chatName)
+-        guard CFEqual(window, checkedWindow), CFEqual(input, checkedInput) else {
+-            throw AutomationError.sendFailed("background_target_changed")
+-        }
+-        try requireHidden()
++        let (_, window, input) = try backgroundTarget(to: chatName)
++        let button = try sendButton(in: window)
++        var pressFailed = false
+         try BackgroundDraftTransaction.replaceAndDispatch(
+-            message: message,
+-            read: { AXHelpers.value(input) },
+-            write: { AXHelpers.setValue(input, $0) },
+-            dispatch: {
+-                // Verify the exact same target after editing, before targeted Return.
++            message: message, read: { AXHelpers.value(input) },
++            write: { AXHelpers.setValue(input, $0) }, dispatch: {
++                let deadline = Date().addingTimeInterval(1)
++                while AXHelpers.boolAttribute(button, kAXEnabledAttribute as String) != true,
++                      Date() < deadline {
++                    Thread.sleep(forTimeInterval: 0.05)
++                }
+                 let (_, currentWindow, currentInput) = try self.backgroundTarget(to: chatName)
+                 guard CFEqual(window, currentWindow), CFEqual(input, currentInput),
+-                      self.inputIsFocused(input, pid: pid) else {
++                      CFEqual(button, try self.sendButton(in: currentWindow)),
++                      AXHelpers.value(input) == message else {
+                     throw AutomationError.sendFailed("background_target_changed")
+                 }
+-                guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
+-                      let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false) else {
+-                    throw AutomationError.sendFailed("background_event_failed")
+-                }
+-                try self.requireHidden()
+-                down.postToPid(pid)
+-                up.postToPid(pid)
++                guard AXHelpers.boolAttribute(button, kAXEnabledAttribute as String) == true else {
++                    throw AutomationError.sendFailed("background_send_button_disabled")
++                }
++                // AXPress can have succeeded even if its response fails. Never retry,
++                // restore the draft, or fall back to Return after attempting it.
++                pressFailed = AXUIElementPerformAction(button, kAXPressAction as CFString) != .success
+             })
++        if pressFailed {
++            throw AutomationError.sendFailed("background_delivery_unconfirmed")
++        }
+         let deadline = Date().addingTimeInterval(2)
+         while Date() < deadline {
++            if (AXHelpers.value(input) ?? message).isEmpty { return }
+             Thread.sleep(forTimeInterval: 0.1)
+-            try requireHidden()
+-            if (AXHelpers.value(input) ?? message).isEmpty { return }
+         }
+         throw AutomationError.sendFailed("background_delivery_unconfirmed")
++    }
++
++    private func sendButton(in window: AXUIElement) throws -> AXUIElement {
++        var buttons: [AXUIElement] = []
++        func visit(_ element: AXUIElement, depth: Int) {
++            guard depth < 10 else { return }
++            let role = AXHelpers.role(element) ?? ""
++            // Do not walk message tables, other windows, or menu contents.
++            if ["AXTable", "AXOutline", "AXMenu", "AXWindow"].contains(role), depth > 0 { return }
++            if role == "AXButton" {
++                let labels = [AXHelpers.title(element), AXHelpers.description(element), AXHelpers.identifier(element)].compactMap { $0 }
++                var names: CFArray?
++                let supportsPress = AXUIElementCopyActionNames(element, &names) == .success
++                    && (names as? [String])?.contains(kAXPressAction as String) == true
++                if SendButtonSelection.matches(labels: labels, supportsPress: supportsPress) {
++                    buttons.append(element)
++                }
++                return
++            }
++            for child in AXHelpers.children(element) { visit(child, depth: depth + 1) }
++        }
++        visit(window, depth: 0)
++        guard buttons.count == 1 else {
++            throw AutomationError.sendFailed("background_send_button_unavailable")
++        }
++        return buttons[0]
+     }
+ 
+     /// Opens or raises only the named chat, preserving every other chat window.
+@@ -368,7 +393,11 @@
+                 // This scroll area should contain the input AXTextArea
+                 for subchild in AXHelpers.children(child) {
+                     if AXHelpers.role(subchild) == "AXTextArea" {
+-                        return subchild
++                        var settable: DarwinBoolean = false
++                        if AXUIElementIsAttributeSettable(subchild, kAXValueAttribute as CFString, &settable) == .success,
++                           settable.boolValue {
++                            return subchild
++                        }
+                     }
+                 }
+             }
+--- /dev/null
++++ b/Sources/KakaoCore/Automation/SendButtonSelection.swift
+@@ -0,0 +1,13 @@
++import Foundation
++
++/// Exact labels only: never confuse scheduling, attachments, or menu controls with Send.
++enum SendButtonSelection {
++    static func matches(labels: [String], supportsPress: Bool) -> Bool {
++        guard supportsPress else { return false }
++        let accepted: Set<String> = ["전송", "보내기", "send", "sendbutton", "sendmessagebutton"]
++        return labels.contains { label in
++            let key = label.lowercased().filter { !$0.isWhitespace && $0 != "_" && $0 != "-" }
++            return accepted.contains(key)
++        }
++    }
++}

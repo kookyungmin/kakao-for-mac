@@ -1,0 +1,32 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -84,9 +84,8 @@
+             _ = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, window)
+         }
+         try requireHidden()
+-        guard AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true else {
+-            throw AutomationError.sendFailed("background_target_not_main")
+-        }
++        // Hidden apps may report AXMain=false even after a successful focus request.
++        // Verify the exact input responder instead of treating AXMain as focus.
+         if inputIsFocused(input, pid: pid) { return }
+         // Change the responder inside the existing app without clicks, raises,
+         // application activation, or global keyboard events.
+@@ -95,7 +94,8 @@
+             let app = AXUIElementCreateApplication(pid)
+             _ = AXUIElementSetAttributeValue(app, kAXFocusedUIElementAttribute as CFString, input)
+         }
+-        for _ in 0..<5 {
++        for _ in 0..<20 {
++            try requireHidden()
+             if inputIsFocused(input, pid: pid) { return }
+             Thread.sleep(forTimeInterval: 0.05)
+         }
+@@ -126,7 +126,6 @@
+                 // Verify the exact same target after editing, before targeted Return.
+                 let (_, currentWindow, currentInput) = try self.backgroundTarget(to: chatName)
+                 guard CFEqual(window, currentWindow), CFEqual(input, currentInput),
+-                      AXHelpers.boolAttribute(window, kAXMainAttribute as String) == true,
+                       self.inputIsFocused(input, pid: pid) else {
+                     throw AutomationError.sendFailed("background_target_changed")
+                 }

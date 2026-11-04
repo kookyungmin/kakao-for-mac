@@ -1,0 +1,74 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -219,7 +219,7 @@
+     }
+ 
+     /// Opens or raises only the named chat, preserving every other chat window.
+-    public func sendForeground(to chatName: String, message: String) throws {
++    public func sendForeground(to chatName: String, message: String, prepareOnly: Bool = false) throws {
+         guard AXIsProcessTrusted() else {
+             throw AutomationError.sendFailed("accessibility_permission_denied")
+         }
+@@ -237,10 +237,10 @@
+         _ = process.activate()
+         let app = AXUIElementCreateApplication(process.processIdentifier)
+         func targetWindow() throws -> AXUIElement? {
+-            let windows = AXHelpers.windows(app).filter { AXHelpers.role($0) == "AXWindow" }
++            let windows = chatWindows(app)
+             do {
+                 return windows[try BackgroundWindowSelection.index(
+-                    titles: windows.map { AXHelpers.title($0) ?? "" }, chatName: chatName)]
++                    titles: windows.map { chatWindowTitle($0) }, chatName: chatName)]
+             } catch {
+                 if ["background_window_required", "background_window_name_mismatch", "background_windows_unavailable"].contains(where: { String(describing: error).contains($0) }) { return nil }
+                 throw error
+@@ -299,6 +299,7 @@
+             }
+         }
+         try verifyTarget()
++        if prepareOnly { return } // Opening/focusing must never edit or send a message.
+         try BackgroundDraftTransaction.replaceAndDispatch(
+             message: message, read: { AXHelpers.value(input) },
+             write: { AXHelpers.setValue(input, $0) }, dispatch: {
+--- a/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
++++ b/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
+@@ -4,7 +4,7 @@
+ import Foundation
+ import KakaoCore
+ 
+-/// Diagnostics never activate or open windows; --hide explicitly hides the app.
++/// Read-only unless --hide, --prepare-input, or --open-chat is explicitly requested.
+ struct DiagnosticsCommand: ParsableCommand {
+     static let configuration = CommandConfiguration(
+         commandName: "diagnostics",
+@@ -23,15 +23,29 @@
+     @Flag(name: .long, help: "Include window titles and control availability; never include message or input contents")
+     var windows = false
+ 
++    @Flag(name: .long, help: "Open and focus the exact chat without editing or sending; restore the previous app")
++    var openChat = false
++
+     func run() throws {
+         guard !prepareInput || chat != nil else {
+             throw ValidationError("--prepare-input requires --chat.")
+         }
++        guard !openChat || (chat != nil && !hide && !prepareInput) else {
++            throw ValidationError("--open-chat requires --chat and cannot be combined with --hide or --prepare-input.")
++        }
+         let automator = KakaoAutomator()
++        if openChat, let chat {
++            let reader = try openDatabase(dbPath: nil, key: nil)
++            defer { reader.close() }
++            guard try reader.chats(limit: 100000).filter({ $0.displayName == chat }).count == 1 else {
++                throw ValidationError("Exact chat name must identify one room.")
++            }
++            try automator.sendForeground(to: chat, message: "", prepareOnly: true)
++        }
+         if hide { try automator.hideApplication() }
+         let running = !NSRunningApplication.runningApplications(withBundleIdentifier: KakaoAutomator.bundleId).isEmpty
+         let trusted = AXIsProcessTrusted()
+-        var data: [String: Any] = ["running": running, "accessibility": trusted, "hidden": automator.isHidden()]
++        var data: [String: Any] = ["running": running, "accessibility": trusted, "hidden": automator.isHidden(), "chat_prepared": openChat]
+         if running && trusted, let app = try? AXHelpers.appElement(bundleId: KakaoAutomator.bundleId) {
+             let windows = AXHelpers.windows(app)
+             data["window_count"] = windows.count
