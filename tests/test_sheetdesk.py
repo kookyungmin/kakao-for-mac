@@ -24,7 +24,7 @@ class BackendTests(unittest.TestCase):
             if args[1] == "chats":
                 return self.response('[{"id":9007199254740993,"display_name":"친구"}]')
             if args[1] == "diagnostics":
-                return self.response('{"background_ready":true}')
+                return self.response('{"background_ready":true,"hidden":true}')
             return self.response("DRY RUN")
         text = '-n $(touch /tmp/should-never-exist) "한글"'
         with patch("sheetdesk.core.subprocess.run", side_effect=run):
@@ -91,6 +91,15 @@ class BackendTests(unittest.TestCase):
             with self.assertRaises(BackendError):
                 self.backend.send(self.room, "안녕")
             run.assert_called_once_with(["send", "--help"])
+
+    def test_prepare_hides_app_and_rejects_visible_state(self):
+        with patch.object(self.backend, "rooms", return_value=[self.room]), \
+             patch.object(self.backend, "diagnostics", return_value={"background_ready":True,"hidden":False}) as diagnostics, \
+             patch.object(self.backend, "run") as run:
+            with self.assertRaisesRegex(BackendError, "숨김"):
+                self.backend.prepare(self.room, "안녕")
+            diagnostics.assert_called_once_with(self.room.name, hide=True)
+            run.assert_not_called()
 
     def test_two_second_rate_limit(self):
         self.backend._last_send = 100
@@ -234,7 +243,7 @@ class ConsoleTests(unittest.TestCase):
         rooms = [Room("2", "김도완 회사"), Room("3", "홍길동"), self.room]
         self.app.events.put(("rooms", None, rooms, None))
         self.app.collect()
-        self.assertEqual(self.app.rooms, [self.room])
+        self.assertEqual(self.app.visible_rooms, [self.room])
         self.assertEqual(self.app.room_id, "1")
         self.assertEqual(self.app.mode, "compose")
         self.app.filter = "홍길동"
@@ -244,6 +253,31 @@ class ConsoleTests(unittest.TestCase):
         self.app.events.put(("rooms", None, [Room("2", "다른 사람")], None))
         self.app.collect()
         self.assertIsNone(self.app.room_id)
+
+    def test_picker_lists_all_rooms_and_switches_only_on_enter(self):
+        other = Room("2", "다른 친구")
+        self.app.events.put(("rooms", None, [self.room, other], None))
+        self.app.collect()
+        self.app.handle("\x0f")
+        self.assertEqual(self.app.visible_rooms, [self.room, other])
+        self.app.handle(curses.KEY_DOWN)
+        self.assertEqual(self.app.room_id, "1")
+        self.app.handle("\n")
+        self.assertEqual(self.app.room_id, "2")
+        self.assertFalse(self.app.room_picker)
+        self.assertEqual(self.app.visible_rooms, [other])
+
+    def test_picker_search_and_cancel_keep_current_room(self):
+        other = Room("2", "다른 친구")
+        self.app.events.put(("rooms", None, [self.room, other], None))
+        self.app.collect()
+        self.app.handle("\x0f")
+        for key in "친구":
+            self.app.handle(key)
+        self.assertEqual(self.app.visible_rooms, [other])
+        self.app.handle("\x1b")
+        self.assertEqual(self.app.room_id, "1")
+        self.assertEqual(self.app.visible_rooms, [self.room])
 
     def test_spacing_variant_is_allowed_but_keeps_actual_send_name(self):
         actual = Room("9", "김 도완")

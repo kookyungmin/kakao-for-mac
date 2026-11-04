@@ -6,6 +6,7 @@ import queue
 import time
 
 from .core import BackendError, clip, safe_text, width, wrap, room_name_key
+from . import __version__
 
 
 class App:
@@ -38,7 +39,7 @@ class App:
     @property
     def visible_rooms(self):
         return [r for r in self.rooms
-                if (not self.allowed_names or room_name_key(r.name) in self.allowed_names)
+                if (self.room_picker or not self.allowed_names or room_name_key(r.name) in self.allowed_names)
                 and self.filter.casefold() in r.name.casefold()]
 
     @property
@@ -65,7 +66,9 @@ class App:
 
     def choose(self, room):
         if self.allowed_names and room_name_key(room.name) not in self.allowed_names:
-            return
+            if not self.room_picker:
+                return
+            self.allowed_names = frozenset([room_name_key(room.name)])
         if self.room_id == room.id:
             return
         if self.room_id is not None:
@@ -96,9 +99,13 @@ class App:
                 continue
             if kind == "rooms":
                 old_id = self.room_id
-                self.rooms = [r for r in result if not self.allowed_names or room_name_key(r.name) in self.allowed_names]
+                before = self.visible_rooms
+                highlighted = before[self.selected].id if self.room_picker and 0 <= self.selected < len(before) else old_id
+                self.rooms = result
                 visible = self.visible_rooms
-                if old_id and any(r.id == old_id for r in visible):
+                if self.room_picker:
+                    self.selected = next((i for i, r in enumerate(visible) if r.id == highlighted), 0)
+                elif old_id and any(r.id == old_id for r in visible):
                     self.selected = next(i for i, r in enumerate(visible) if r.id == old_id)
                 elif visible:
                     self.selected = 0
@@ -121,6 +128,8 @@ class App:
                     self.mode = "compose"
                     self.last_poll = float("-inf")
                 self.note("전송 요청 완료 · 실제 반영은 대화 조회에서 확인합니다")
+            elif kind == "hide":
+                self.note("백그라운드 연결 준비됨")
             self.dirty = True
 
     def poll(self):
@@ -151,6 +160,8 @@ class App:
             curses.init_pair(2, curses.COLOR_CYAN, -1)
             curses.init_pair(3, curses.COLOR_RED, -1)
         try:
+            if not self.args.demo:
+                self.job("hide", None, self.backend.hide)
             while self.running:
                 self.collect()
                 self.poll()
@@ -204,8 +215,36 @@ class App:
             return
         if key == "\x0f" and self.view == "console":
             self.room_picker = not self.room_picker
+            self.filter = ""
+            rooms = self.visible_rooms
+            self.selected = next((i for i, room in enumerate(rooms) if room.id == self.room_id), 0)
             self.mode = "browse" if self.room_picker else ("browse" if self.args.readonly else "compose")
             self.focus = "rooms" if self.room_picker else "messages"
+            return
+        if self.room_picker and self.view == "console":
+            rooms = self.visible_rooms
+            if key == "\x1b":
+                self.room_picker = False
+                self.filter = ""
+                self.mode = "browse" if self.args.readonly else "compose"
+            elif key in (curses.KEY_UP, curses.KEY_DOWN):
+                delta = -1 if key == curses.KEY_UP else 1
+                self.selected = max(0, min(len(rooms) - 1, self.selected + delta))
+            elif key in ("\n", "\r", curses.KEY_ENTER) and rooms:
+                self.choose(rooms[self.selected])
+                self.room_picker = False
+                self.filter = ""
+                self.mode = "browse" if self.args.readonly else "compose"
+                self.focus = "messages"
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                self.filter = self.filter[:-1]
+                self.selected = 0
+            elif key == "\x15":
+                self.filter = ""
+                self.selected = 0
+            elif isinstance(key, str) and key.isprintable():
+                self.filter += key
+                self.selected = 0
             return
         if key == curses.KEY_PPAGE:
             self.offset += max(1, self.screen.getmaxyx()[0] - 12)
@@ -355,7 +394,7 @@ class App:
         name = self.room.name if self.room else "연결 중"
         header = [
             "╭" + "─" * (card_width - 2) + "╮",
-            "│ >_ Sheetdesk  (local console)".ljust(card_width - 1) + "│",
+            ("│ >_ Sheetdesk {}  (local console)".format(__version__)).ljust(card_width - 1) + "│",
             "│ session: " + name,
             "╰" + "─" * (card_width - 2) + "╯",
         ]
@@ -404,14 +443,17 @@ class App:
                 pass
 
     def draw_rooms(self, height, cols):
-        y, x, w, h = self.panel(height, cols, "세션 목록 — 지정한 대화방만 표시")
+        y, x, w, h = self.panel(height, cols, "전체 대화방 목록 · 검색: " + self.filter)
         rooms = self.visible_rooms
-        for index, room in enumerate(rooms[:h - 4]):
-            self.put(y + 2 + index, x + 2, ("› " if room.id == self.room_id else "  ") + room.name,
+        capacity = h - 4
+        start = max(0, self.selected - capacity + 1)
+        for line, room in enumerate(rooms[start:start + capacity]):
+            index = start + line
+            self.put(y + 2 + line, x + 2, ("› " if index == self.selected else "  ") + room.name,
                      curses.A_REVERSE | (curses.A_BOLD if index == self.selected else 0), w - 4)
         if not rooms:
-            self.put(y + 2, x + 2, "이름이 정확히 일치하는 방이 없습니다.", curses.A_REVERSE, w - 4)
-        self.put(y + h - 2, x + 2, "↑↓ 선택 · Enter 입력 · Ctrl+O 닫기", curses.A_REVERSE, w - 4)
+            self.put(y + 2, x + 2, "일치하는 대화방이 없습니다.", curses.A_REVERSE, w - 4)
+        self.put(y + h - 2, x + 2, "이름 입력 검색 · ↑↓ 이동 · Enter 선택 · Esc 닫기", curses.A_REVERSE, w - 4)
 
     def draw_main(self, height, cols):
         left = 27 if cols >= 105 else 23

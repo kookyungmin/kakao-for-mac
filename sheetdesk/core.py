@@ -28,10 +28,12 @@ def background_hint(reason):
         "background_multiple_windows": "대화 창이 여러 개입니다. 대상 대화 창만 남겨야 백그라운드로 전송할 수 있습니다.",
         "background_target_mismatch": "열린 대화 창이 선택한 방과 다릅니다. 대상 방만 열어 주세요.",
         "background_window_minimized": "대화 창의 최소화를 풀고 터미널 뒤에 두세요. 자동으로 창을 복원하지 않습니다.",
-        "background_target_not_main": "카톡에서 대상 대화 창을 한 번 선택한 뒤 터미널로 돌아오세요.",
+        "background_target_not_main": "대상 대화 창의 포커스 자동 지정에 실패했습니다. 창 상태를 다시 확인합니다.",
         "background_input_not_focused": "백그라운드 입력 포커스를 지정하지 못했습니다. 수정된 kakaocli 버전을 확인하세요.",
         "background_focus_failed": "입력 포커스 자동 지정에 실패했습니다. 카톡 UI가 백그라운드 포커스를 허용하지 않는 상태입니다.",
-        "background_existing_draft": "원래 카톡 입력창에 초안이 있습니다. 덮어쓰지 않으므로 먼저 확인하세요.",
+        "background_cannot_hide": "카톡 숨김을 확인하지 못해 중단했습니다. 창을 앞으로 띄우는 전송은 하지 않습니다.",
+        "background_became_visible": "카톡의 숨김 상태가 풀려 다시 숨기고 중단했습니다. 자동 재전송하지 않습니다.",
+        "background_existing_draft": "이전 실행 파일의 초안 차단입니다. 앱을 종료하고 수정본으로 다시 실행하세요.",
         "background_set_value_failed": "백그라운드 입력이 지원되지 않거나 실패했습니다. 원래 카톡 입력창을 확인하세요.",
         "background_target_changed": "전송 직전 대상 창이 바뀌어 중단했습니다. 카톡 입력창을 확인하세요.",
         "background_event_failed": "백그라운드 키 이벤트를 만들지 못했습니다. 자동 재전송하지 않습니다.",
@@ -189,8 +191,10 @@ class KakaoBackend:
     def rooms(self):
         return [Room.parse(row) for row in self.json(["chats", "--json", "--limit", "100000"])]
 
-    def diagnostics(self, room_name=None):
+    def diagnostics(self, room_name=None, hide=False):
         args = ["diagnostics"]
+        if hide:
+            args.append("--hide")
         if room_name:
             args += ["--chat", room_name]
         try:
@@ -200,6 +204,12 @@ class KakaoBackend:
         if not isinstance(result, dict):
             raise BackendError("진단 응답 형식이 잘못됐습니다.")
         return result
+
+    def hide(self):
+        status = self.diagnostics(hide=True)
+        if not status.get("hidden"):
+            raise BackendError(background_hint("background_cannot_hide"))
+        return status
 
     def messages(self, room_id, limit=200):
         return ordered_messages(self.json(["messages", "--chat-id", str(room_id), "--limit", str(limit), "--json"]))
@@ -220,9 +230,11 @@ class KakaoBackend:
         if len(text) > 4000 or "\x00" in text:
             raise BackendError("메시지는 4,000자 이하로 입력하세요. NUL 문자는 사용할 수 없습니다.")
         self.validate_target(room)
-        diagnostics = self.diagnostics(room.name)
+        diagnostics = self.diagnostics(room.name, hide=True)
         if not diagnostics.get("background_ready"):
             raise BackendError(background_hint(diagnostics.get("background_reason", "")))
+        if not diagnostics.get("hidden"):
+            raise BackendError(background_hint("background_cannot_hide"))
         # The '--' also prevents messages beginning with '-' from becoming CLI flags.
         self.run(["send", "--dry-run", "--exact", "--background", "--message-stdin", "--", room.name], private=True, input_text=text)
 

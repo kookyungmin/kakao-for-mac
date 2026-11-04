@@ -41,7 +41,8 @@ def main():
                 print("카톡 실행: {}".format("예" if diagnostics.get("running") else "아니오"))
                 print("손쉬운 사용 권한: {}".format("허용" if diagnostics.get("accessibility") else "없음 — 실행 터미널을 시스템 설정에서 허용하세요"))
                 if diagnostics.get("accessibility"):
-                    print("채팅 목록 접근: {}".format("가능" if diagnostics.get("chat_list_available") else "카톡 메인 채팅 목록 창을 여세요"))
+                    if diagnostics.get("chat_list_available"):
+                        print("채팅 목록 접근: 가능")
                     if "exact_room_visible" in diagnostics:
                         print("지정된 방 완전 일치: {}".format("확인" if diagnostics["exact_room_visible"] else "현재 카톡 목록에서 찾지 못함"))
                 print("백그라운드 전송 준비: {}".format("완료" if diagnostics.get("background_ready") else background_hint(diagnostics.get("background_reason", ""))))
