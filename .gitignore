@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .DS_Store
-vendor/kakaocli/.build/
+/vendor/kakaocli/
 .venv/
 .state/
 tools/recover-user

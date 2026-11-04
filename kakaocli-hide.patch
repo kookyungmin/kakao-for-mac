@@ -1,0 +1,133 @@
+--- a/Sources/KakaoCore/Automation/KakaoAutomator.swift
++++ b/Sources/KakaoCore/Automation/KakaoAutomator.swift
+@@ -7,6 +7,38 @@
+     public static let bundleId = "com.kakao.KakaoTalkMac"
+ 
+     public init() {}
++
++    public func isHidden() -> Bool {
++        guard let process = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleId).first,
++              process.isHidden,
++              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
++            return false
++        }
++        return !windows.contains { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == process.processIdentifier }
++    }
++
++    public func hideApplication() throws {
++        guard AXIsProcessTrusted() else {
++            throw AutomationError.sendFailed("accessibility_permission_denied")
++        }
++        guard let process = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleId).first else {
++            throw AutomationError.sendFailed("background_app_not_running")
++        }
++        if isHidden() { return }
++        _ = process.hide()
++        for _ in 0..<20 {
++            if isHidden() { return }
++            Thread.sleep(forTimeInterval: 0.05)
++        }
++        throw AutomationError.sendFailed("background_cannot_hide")
++    }
++
++    private func requireHidden() throws {
++        guard isHidden() else {
++            try? hideApplication()
++            throw AutomationError.sendFailed("background_cannot_hide")
++        }
++    }
+ 
+     /// Never activates, opens, raises, clicks, or changes the selected chat.
+     /// Refuses to act unless the sole existing input window is the named main window.
+@@ -17,6 +49,7 @@
+         guard let process = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleId).first else {
+             throw AutomationError.sendFailed("background_app_not_running")
+         }
++        try requireHidden()
+         let app = AXUIElementCreateApplication(process.processIdentifier)
+         let candidates = AXHelpers.windows(app).compactMap { window -> (AXUIElement, AXUIElement)? in
+             guard AXHelpers.role(window) == "AXWindow", let input = findInputField(in: window) else { return nil }
+@@ -76,15 +109,18 @@
+     public func prepareBackgroundInput(to chatName: String) throws {
+         let (pid, _, input) = try backgroundTarget(to: chatName)
+         try focusBackgroundInput(input, pid: pid)
++        try requireHidden()
+     }
+ 
+     public func sendBackground(to chatName: String, message: String) throws {
++        try hideApplication()
+         let (pid, window, input) = try backgroundTarget(to: chatName)
+         try focusBackgroundInput(input, pid: pid)
+         let (_, checkedWindow, checkedInput) = try backgroundTarget(to: chatName)
+         guard CFEqual(window, checkedWindow), CFEqual(input, checkedInput) else {
+             throw AutomationError.sendFailed("background_target_changed")
+         }
++        try requireHidden()
+         guard AXHelpers.setValue(input, message), AXHelpers.value(input) == message else {
+             throw AutomationError.sendFailed("background_set_value_failed")
+         }
+@@ -97,11 +133,13 @@
+               let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false) else {
+             throw AutomationError.sendFailed("background_event_failed")
+         }
++        try requireHidden()
+         down.postToPid(pid)
+         up.postToPid(pid)
+         let deadline = Date().addingTimeInterval(2)
+         while Date() < deadline {
+             Thread.sleep(forTimeInterval: 0.1)
++            try requireHidden()
+             if (AXHelpers.value(input) ?? message).isEmpty { return }
+         }
+         throw AutomationError.sendFailed("background_delivery_unconfirmed")
+--- a/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
++++ b/Sources/KakaoCLI/Commands/DiagnosticsCommand.swift
+@@ -4,7 +4,7 @@
+ import Foundation
+ import KakaoCore
+ 
+-/// Read-only diagnostics: no activation, login, window changes, or message values.
++/// Diagnostics never activate or open windows; --hide explicitly hides the app.
+ struct DiagnosticsCommand: ParsableCommand {
+     static let configuration = CommandConfiguration(
+         commandName: "diagnostics",
+@@ -17,13 +17,18 @@
+     @Flag(name: .long, help: "Set focus inside an existing verified chat window; never type, send, or activate the app")
+     var prepareInput = false
+ 
++    @Flag(name: .long, help: "Hide KakaoTalk and verify no windows remain on screen")
++    var hide = false
++
+     func run() throws {
+         guard !prepareInput || chat != nil else {
+             throw ValidationError("--prepare-input requires --chat.")
+         }
++        let automator = KakaoAutomator()
++        if hide { try automator.hideApplication() }
+         let running = !NSRunningApplication.runningApplications(withBundleIdentifier: KakaoAutomator.bundleId).isEmpty
+         let trusted = AXIsProcessTrusted()
+-        var data: [String: Any] = ["running": running, "accessibility": trusted]
++        var data: [String: Any] = ["running": running, "accessibility": trusted, "hidden": automator.isHidden()]
+         if running && trusted, let app = try? AXHelpers.appElement(bundleId: KakaoAutomator.bundleId) {
+             let windows = AXHelpers.windows(app)
+             data["window_count"] = windows.count
+@@ -39,7 +44,6 @@
+         }
+         if let chat {
+             do {
+-                let automator = KakaoAutomator()
+                 try automator.checkBackground(to: chat)
+                 if prepareInput {
+                     let before = NSWorkspace.shared.frontmostApplication?.processIdentifier
+--- a/Sources/KakaoCLI/Commands/SendCommand.swift
++++ b/Sources/KakaoCLI/Commands/SendCommand.swift
+@@ -47,6 +47,9 @@
+         }
+         let automator = KakaoAutomator()
+         let target = selfChat ? "self-chat" : chat
++        guard background, exact, !selfChat else {
++            throw ValidationError("This build requires --background --exact and does not support --me.")
++        }
+         if dryRun {
+             print("DRY RUN: Would send to '\(target)': \(payload)")
+             print(background ? "Background only: verify existing named window → AX set value → targeted Return" : "Steps: activate KakaoTalk → find chat '\(target)' → type message → press Enter")
